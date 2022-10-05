@@ -88,43 +88,165 @@ pub fn node_to_stream(node: &Node, f: &mut dyn io::Write) -> io::Result<()> {
     Ok(())
 }
 
+/// This data structure is used with `parse_triples`, which returns a triple of
+/// integer values for each clvm object in a tree.
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ParsedTriple {
+    Atom {
+        start: u64,
+        end: u64,
+        atom_offset: u32,
+    },
+    Pair {
+        start: u64,
+        end: u64,
+        right_index: u32,
+    },
+}
+
+enum ParseOpRef {
+    ParseObj,
+    SaveCursor(usize),
+    SaveIndex(usize),
+}
+
+fn skip_bytes<R: io::Read>(f: &mut R, skip_size: u64) -> io::Result<u64> {
+    io::copy(&mut f.by_ref().take(skip_size), &mut io::sink())
+}
+
+/// parse a serialized clvm object tree to an array of `ParsedTriple` objects
+
+/// This alternative mechanism of deserialization generates an array of
+/// references to each clvm object. A reference contains three values:
+/// a start offset within the blob, an end offset, and a third value that
+/// is either: an atom offset (relative to the start offset) where the atom
+/// data starts (and continues to the end offset); or an index in the array
+/// corresponding to the "right" element of the pair (in which case, the
+/// "left" element corresponds to the next index in the array).
+///
+/// Since these values are offsets into the original buffer, that buffer needs
+/// to be kept around to get the original atoms.
+
+pub fn parse_triples<R: io::Read>(f: &mut R) -> io::Result<Vec<ParsedTriple>> {
+    let mut r = Vec::new();
+    let mut op_stack = vec![ParseOpRef::ParseObj];
+    let mut cursor: u64 = 0;
+    loop {
+        match op_stack.pop() {
+            None => {
+                break;
+            }
+            Some(op) => match op {
+                ParseOpRef::ParseObj => {
+                    let mut b: [u8; 1] = [0];
+                    f.read_exact(&mut b)?;
+                    let start = cursor as u64;
+                    cursor += 1;
+                    let b = b[0];
+                    if b == CONS_BOX_MARKER {
+                        let index = r.len();
+                        let new_obj = ParsedTriple::Pair {
+                            start,
+                            end: 0,
+                            right_index: 0,
+                        };
+                        r.push(new_obj);
+                        op_stack.push(ParseOpRef::SaveCursor(index));
+                        op_stack.push(ParseOpRef::ParseObj);
+                        op_stack.push(ParseOpRef::SaveIndex(index));
+                        op_stack.push(ParseOpRef::ParseObj);
+                    } else {
+                        let (start, end, atom_offset) = {
+                            if b <= MAX_SINGLE_BYTE {
+                                (start, start + 1, 0)
+                            } else {
+                                let (atom_offset, atom_size) = decode_size(f, b)?;
+                                skip_bytes(f, atom_size)?;
+                                let end = start + (atom_offset as u64) + (atom_size as u64);
+                                (start, end, atom_offset as u32)
+                            }
+                        };
+                        let new_obj = ParsedTriple::Atom {
+                            start,
+                            end,
+                            atom_offset,
+                        };
+                        cursor = end;
+                        r.push(new_obj);
+                    }
+                }
+                ParseOpRef::SaveCursor(index) => {
+                    if let ParsedTriple::Pair {
+                        start,
+                        end: _,
+                        right_index,
+                    } = r[index]
+                    {
+                        r[index] = ParsedTriple::Pair {
+                            start,
+                            end: cursor,
+                            right_index,
+                        };
+                    }
+                }
+                ParseOpRef::SaveIndex(index) => {
+                    if let ParsedTriple::Pair {
+                        start,
+                        end,
+                        right_index: _,
+                    } = r[index]
+                    {
+                        r[index] = ParsedTriple::Pair {
+                            start,
+                            end,
+                            right_index: r.len() as u32,
+                        };
+                    }
+                }
+            },
+        }
+    }
+    Ok(r)
+}
+
 /// decode the length prefix for an atom. Atoms whose value fit in 7 bits
 /// don't have a length prefix, so those should be handled specially and
 /// never passed to this function.
-fn decode_size(f: &mut dyn io::Read, initial_b: u8) -> io::Result<u64> {
+fn decode_size<R: io::Read>(f: &mut R, initial_b: u8) -> io::Result<(u8, u64)> {
     debug_assert!((initial_b & 0x80) != 0);
     if (initial_b & 0x80) == 0 {
         return Err(internal_error());
     }
 
-    let mut bit_count = 0;
+    let mut atom_start_offset = 0;
     let mut bit_mask: u8 = 0x80;
     let mut b = initial_b;
     while b & bit_mask != 0 {
-        bit_count += 1;
+        atom_start_offset += 1;
         b &= 0xff ^ bit_mask;
         bit_mask >>= 1;
     }
     let mut size_blob: Vec<u8> = Vec::new();
-    size_blob.resize(bit_count, 0);
+    size_blob.resize(atom_start_offset, 0);
     size_blob[0] = b;
-    if bit_count > 1 {
-        let remaining_buffer = &mut size_blob[1..];
+    if atom_start_offset > 1 {
+        let remaining_buffer = &mut size_blob[1..atom_start_offset];
         f.read_exact(remaining_buffer)?;
     }
     // need to convert size_blob to an int
-    let mut v: u64 = 0;
+    let mut atom_size: u64 = 0;
     if size_blob.len() > 6 {
         return Err(bad_encoding());
     }
     for b in &size_blob {
-        v <<= 8;
-        v += *b as u64;
+        atom_size <<= 8;
+        atom_size += *b as u64;
     }
-    if v >= 0x400000000 {
+    if atom_size >= 0x400000000 {
         return Err(bad_encoding());
     }
-    Ok(v)
+    Ok((atom_start_offset as u8, atom_size))
 }
 
 enum ParseOp {
@@ -157,8 +279,8 @@ pub fn node_from_stream(allocator: &mut Allocator, f: &mut Cursor<&[u8]>) -> io:
                 } else if b[0] <= MAX_SINGLE_BYTE {
                     values.push(allocator.new_atom(&b)?);
                 } else {
-                    let blob_size = decode_size(f, b[0])?;
-                    if (f.get_ref().len() as u64) < blob_size {
+                    let (_prefix_size, blob_size) = decode_size(f, b[0])?;
+                    if (f.get_ref().len()) < blob_size as usize {
                         return Err(bad_encoding());
                     }
                     let mut blob: Vec<u8> = vec![0; blob_size as usize];
@@ -215,7 +337,7 @@ pub fn serialized_length_from_bytes(b: &[u8]) -> io::Result<u64> {
                     // or the
                     // special case of NIL
                 } else {
-                    let blob_size = decode_size(&mut f, b[0])?;
+                    let (_prefix_size, blob_size) = decode_size(&mut f, b[0])?;
                     f.seek(SeekFrom::Current(blob_size as i64))?;
                     if (f.get_ref().len() as u64) < f.position() {
                         return Err(bad_encoding());
@@ -271,11 +393,12 @@ pub fn tree_hash_from_stream(f: &mut Cursor<&[u8]>) -> io::Result<[u8; 32]> {
                 } else if b[0] <= MAX_SINGLE_BYTE {
                     values.push(hash_atom(&b));
                 } else {
-                    let blob_size = decode_size(f, b[0])?;
+                    let (_, blob_size) = decode_size(f, b[0])?;
                     let blob = &f.get_ref()[f.position() as usize..];
-                    if (blob.len() as u64) < blob_size {
+                    if blob.len() < blob_size as usize {
                         return Err(bad_encoding());
                     }
+                    let blob_size = blob_size as u64;
                     f.set_position(f.position() + blob_size);
                     values.push(hash_atom(&blob[..blob_size as usize]));
                 }
@@ -559,12 +682,12 @@ fn test_write_atom() {
 fn test_decode_size() {
     // single-byte length prefix
     let mut buffer = Cursor::new(&[]);
-    assert_eq!(decode_size(&mut buffer, 0x80 | 0x20).unwrap(), 0x20);
+    assert_eq!(decode_size(&mut buffer, 0x80 | 0x20).unwrap(), (1, 0x20));
 
     // two-byte length prefix
     let first = 0b11001111;
     let mut buffer = Cursor::new(&[0xaa]);
-    assert_eq!(decode_size(&mut buffer, first).unwrap(), 0xfaa);
+    assert_eq!(decode_size(&mut buffer, first).unwrap(), (2, 0xfaa));
 }
 
 #[test]
@@ -591,7 +714,7 @@ fn test_large_decode_size() {
     // Still a very large blob, probably enough for a DoS attack
     let first = 0b11111100;
     let mut buffer = Cursor::new(&[0x3, 0xff, 0xff, 0xff, 0xff]);
-    assert_eq!(decode_size(&mut buffer, first).unwrap(), 0x3ffffffff);
+    assert_eq!(decode_size(&mut buffer, first).unwrap(), (6, 0x3ffffffff));
 }
 
 #[test]
@@ -602,4 +725,97 @@ fn test_truncated_decode_size() {
     let ret = decode_size(&mut buffer, first);
     let e = ret.unwrap_err();
     assert_eq!(e.kind(), ErrorKind::UnexpectedEof);
+}
+
+#[cfg(test)]
+fn check_parse_triple(h: &str, expected: Vec<ParsedTriple>) -> () {
+    let b = Vec::from_hex(h).unwrap();
+    println!("{:?}", b);
+    let mut f = Cursor::new(b);
+    let p = parse_triples(&mut f).unwrap();
+    assert_eq!(p, expected);
+}
+
+#[test]
+fn test_parse_triple() {
+    check_parse_triple(
+        "80",
+        vec![ParsedTriple::Atom {
+            start: 0,
+            end: 1,
+            atom_offset: 1,
+        }],
+    );
+
+    check_parse_triple(
+        "ff648200c8",
+        vec![
+            ParsedTriple::Pair {
+                start: 0,
+                end: 5,
+                right_index: 2,
+            },
+            ParsedTriple::Atom {
+                start: 1,
+                end: 2,
+                atom_offset: 0,
+            },
+            ParsedTriple::Atom {
+                start: 2,
+                end: 5,
+                atom_offset: 1,
+            },
+        ],
+    );
+
+    check_parse_triple(
+        "ff83666f6fff83626172ff8362617a80", // `(foo bar baz)`
+        vec![
+            ParsedTriple::Pair {
+                start: 0,
+                end: 16,
+                right_index: 2,
+            },
+            ParsedTriple::Atom {
+                start: 1,
+                end: 5,
+                atom_offset: 1,
+            },
+            ParsedTriple::Pair {
+                start: 5,
+                end: 16,
+                right_index: 4,
+            },
+            ParsedTriple::Atom {
+                start: 6,
+                end: 10,
+                atom_offset: 1,
+            },
+            ParsedTriple::Pair {
+                start: 10,
+                end: 16,
+                right_index: 6,
+            },
+            ParsedTriple::Atom {
+                start: 11,
+                end: 15,
+                atom_offset: 1,
+            },
+            ParsedTriple::Atom {
+                start: 15,
+                end: 16,
+                atom_offset: 1,
+            },
+        ],
+    );
+
+    let s = "c0a0".to_owned() + &hex::encode([0x31u8; 160]);
+    check_parse_triple(
+        &s,
+        vec![ParsedTriple::Atom {
+            start: 0,
+            end: 162,
+            atom_offset: 2,
+        }],
+    );
 }

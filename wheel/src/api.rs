@@ -6,9 +6,10 @@ use clvmr::allocator::Allocator;
 use clvmr::chia_dialect::ChiaDialect;
 use clvmr::chia_dialect::{NO_NEG_DIV, NO_UNKNOWN_OPS};
 use clvmr::cost::Cost;
+use clvmr::deserialize_tree::{deserialize_tree, CLVMTreeBoundary};
 use clvmr::reduction::Response;
 use clvmr::run_program::run_program;
-use clvmr::serialize::{node_from_bytes, parse_triples, ParsedTriple};
+use clvmr::serialize::node_from_bytes;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use pyo3::wrap_pyfunction;
@@ -34,14 +35,14 @@ pub fn run_serialized_program(
     adapt_response(py, allocator, r)
 }
 
-fn tuple_for_parsed_triple(py: Python<'_>, p: &ParsedTriple) -> PyObject {
+fn tuple_for_parsed_triple(py: Python<'_>, p: &CLVMTreeBoundary) -> PyObject {
     let tuple = match p {
-        ParsedTriple::Atom {
+        CLVMTreeBoundary::Atom {
             start,
             end,
             atom_offset,
         } => PyTuple::new(py, [*start, *end, *atom_offset as u64]),
-        ParsedTriple::Pair {
+        CLVMTreeBoundary::Pair {
             start,
             end,
             right_index,
@@ -51,9 +52,9 @@ fn tuple_for_parsed_triple(py: Python<'_>, p: &ParsedTriple) -> PyObject {
 }
 
 #[pyfunction]
-fn deserialize_as_triples(py: Python, blob: &[u8]) -> PyResult<Vec<PyObject>> {
+fn deserialize_as_tree(py: Python, blob: &[u8]) -> PyResult<Vec<PyObject>> {
     let mut cursor = io::Cursor::new(blob);
-    let r = parse_triples(&mut cursor)?;
+    let r = deserialize_tree(&mut cursor)?;
     let r = r.iter().map(|pt| tuple_for_parsed_triple(py, pt)).collect();
     Ok(r)
 }
@@ -61,7 +62,7 @@ fn deserialize_as_triples(py: Python, blob: &[u8]) -> PyResult<Vec<PyObject>> {
 #[pymodule]
 fn clvm_rs(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_serialized_program, m)?)?;
-    m.add_function(wrap_pyfunction!(deserialize_as_triples, m)?)?;
+    m.add_function(wrap_pyfunction!(deserialize_as_tree, m)?)?;
     m.add("NO_NEG_DIV", NO_NEG_DIV)?;
     m.add("NO_UNKNOWN_OPS", NO_UNKNOWN_OPS)?;
     m.add_class::<LazyNode>()?;
